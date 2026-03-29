@@ -197,7 +197,7 @@ The experiment is designed to answer one narrow question: does hardware partitio
 - **MIG trades utilization for isolation.** Each `1g.5gb` slice has 1/7th of the GPU's memory bandwidth whether its tenant is busy or idle. Unused capacity in one slice cannot spill over to help a busy neighbor. If your tenants have bursty, uneven traffic, the efficiency cost is real.
 - **The noisy tenants also pay a latency price.** In shared mode their p95 latencies during burst phases reach 10–12 seconds. In MIG mode each noisy tenant is isolated within its own slice, so their burst latencies reflect their own load, not cross-tenant contention. This is not necessarily better — it just means each tenant's performance is self-contained.
 
-For the full analysis including what failed, root causes, and conclusions, see the [article](article/multi-tenancy-on-nvidia-gpus-proving-qos-with-mig.md).
+For the full analysis including what failed, root causes, and conclusions, see the [article](https://medium.com/@owumifestus/multi-tenancy-on-nvidia-gpus-benchmarking-latency-isolation-with-mig).
 
 ## Operational notes
 
