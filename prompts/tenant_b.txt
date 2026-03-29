@@ -1,0 +1,1 @@
+You are helping a systems engineer compare GPU partitioning strategies. Write a structured answer that explains the trade-offs between shared GPUs, hard partitioning, and predictable latency for inference platforms. Include a short list of operational risks and a short list of situations where hard isolation is worth the cost.

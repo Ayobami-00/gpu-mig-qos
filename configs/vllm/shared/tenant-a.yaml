@@ -1,0 +1,10 @@
+host: 0.0.0.0
+port: 8000
+dtype: half
+max-model-len: 2048
+max-num-seqs: 8
+max-num-batched-tokens: 1024
+gpu-memory-utilization: 0.12
+enforce-eager: true
+disable-log-stats: true
+uvicorn-log-level: info

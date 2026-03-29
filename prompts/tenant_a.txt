@@ -1,0 +1,1 @@
+Explain the Rust ownership model in two short paragraphs, then give a six-line Rust example involving borrowing, and finish with two brief bullet takeaways.
