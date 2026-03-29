@@ -33,7 +33,7 @@ gpu-mig-qos/
 ├── logs/                      # vLLM server stdout/stderr per tenant per mode
 ├── prompts/
 │   ├── tenant_a.txt           # Short, steady prompt — the protected tenant
-│   └── tenant_b.txt           # Heavier structured prompt — shared by all noisy tenants B–G
+│   └── tenant_b_g.txt         # Heavier structured prompt — shared by all noisy tenants B–G
 ├── scripts/
 │   ├── bootstrap_lambda_host.sh
 │   ├── bootstrap_vllm_mig_fix.sh  # Applies vLLM [PR #35526](https://github.com/vllm-project/vllm/pull/35526) (MIG UUID fix)
