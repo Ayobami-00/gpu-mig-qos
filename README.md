@@ -36,7 +36,7 @@ gpu-mig-qos/
 │   └── tenant_b.txt           # Heavier structured prompt — shared by all noisy tenants B–G
 ├── scripts/
 │   ├── bootstrap_lambda_host.sh
-│   ├── bootstrap_vllm_mig_fix.sh  # Applies vLLM PR #35526 (MIG UUID fix)
+│   ├── bootstrap_vllm_mig_fix.sh  # Applies vLLM [PR #35526](https://github.com/vllm-project/vllm/pull/35526) (MIG UUID fix)
 │   ├── capture_state.sh
 │   ├── disable_mig.sh
 │   ├── enable_mig_a100_40gb.sh    # Creates 7 × 1g.5gb MIG slices
@@ -92,7 +92,7 @@ flowchart LR
 
 Python dependencies (`requirements.txt`): `httpx`, `PyYAML`, `pandas`, `matplotlib`.
 
-> **vLLM build note**: The stock `pip install vllm` does not handle MIG UUID device identifiers. Run `bootstrap_vllm_mig_fix.sh` to apply PR #35526 before using MIG mode.
+> **vLLM build note**: The stock `pip install vllm` does not handle MIG UUID device identifiers. Run `bootstrap_vllm_mig_fix.sh` to apply [PR #35526](https://github.com/vllm-project/vllm/pull/35526) before using MIG mode.
 
 ## Quickstart
 
@@ -111,7 +111,7 @@ chmod +x ./scripts/bootstrap_vllm_mig_fix.sh
 ./scripts/bootstrap_vllm_mig_fix.sh
 ```
 
-See [docs/MIG_SETUP.md](docs/MIG_SETUP.md) for details on the MIG UUID bug and the fix.
+
 
 ### 3. Set environment variables
 
@@ -198,11 +198,3 @@ The experiment is designed to answer one narrow question: does hardware partitio
 - **The noisy tenants also pay a latency price.** In shared mode their p95 latencies during burst phases reach 10–12 seconds. In MIG mode each noisy tenant is isolated within its own slice, so their burst latencies reflect their own load, not cross-tenant contention. This is not necessarily better — it just means each tenant's performance is self-contained.
 
 For the full analysis including what failed, root causes, and conclusions, see the [article](https://medium.com/@owumifestus/multi-tenancy-on-nvidia-gpus-benchmarking-latency-isolation-with-mig).
-
-## Operational notes
-
-1. `1g.5gb` is the A100 **40GB** profile. An A100 80GB uses `1g.10gb`. Profile names are SKU-specific.
-2. MIG geometry is not persistent across reboot. Re-run `enable_mig_a100_40gb.sh` after host resets.
-3. `nvidia-smi` does not attribute per-MIG utilization on Ampere. Use DCGM for MIG-aware GPU metrics.
-4. The 50-second startup stagger in `start_shared_mode.sh` is required. Without it, simultaneous vLLM memory profiling across 7 processes exhausts the 40GB and crashes servers during startup.
-5. Both modes use `enforce-eager: true` to disable CUDA graph capture. This keeps the execution model identical between shared and MIG so the only variable is the hardware boundary.
