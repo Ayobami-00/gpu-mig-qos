@@ -10,7 +10,7 @@ Hardware: Lambda `1x A100 40GB SXM4` · Model: `Qwen/Qwen2.5-1.5B-Instruct` · S
 
 ## Article
 
-[Multi-Tenancy on NVIDIA GPUs: Proving QoS with MIG](https://medium.com/@owumifestus/multi-tenancy-on-nvidia-gpus-benchmarking-latency-isolation-with-mig)
+[Multi-Tenancy on NVIDIA GPUs: Proving QoS with MIG](https://medium.com/@owumifestus/benchmarking-noisy-neighbor-isolation-on-an-a100-shared-vllm-vs-1g-5gb-mig-slices-d45f777d99f0)
 
 The article covers the full experiment: architecture, implementation, what failed and why, results, and conclusions.
 
@@ -368,7 +368,21 @@ Outputs:
 | `all_tenants_quiet_p95.png` | All 7 tenants quiet-phase p95, side-by-side |
 | `tenant_a_p95_timeline.png` | Tenant A latency timeline across all phases |
 
+## What did not work and why
+
+Before arriving at the final seven-tenant design, several earlier versions failed in instructive ways.
+
+**Attempt 1: Two tenants were not enough.** The first version used just one protected tenant and one noisy neighbor. It showed almost no meaningful separation between shared mode and MIG mode — shared mode sat around 1,186ms p95, MIG mode around 1,307ms p95, and the burst had no real effect in either setup. In hindsight that makes sense. An A100 40GB is a large device, and two 1.5B inference services simply did not create enough pressure to expose the behavior worth measuring.
+
+**Attempt 2: Higher client load did not automatically create higher GPU pressure.** Making the noisy tenant more aggressive — higher RPS, higher concurrency, longer outputs — still had no meaningful effect. The bottleneck had shifted upward into the request path rather than the GPU itself. More client pressure did not necessarily mean more simultaneous pressure on the hardware. You can increase load-generator settings and still fail to create the contention you think you are measuring.
+
+**Attempt 3: Changing execution mode would have invalidated the comparison.** At one point enabling CUDA graphs for tenant A while leaving the rest of the benchmark in eager mode was considered. That would have been the wrong move. If the goal is to isolate the effect of MIG, the software execution path must remain comparable between the two hardware modes — otherwise two variables change at once.
+
+**Attempt 4: Starting all seven tenants simultaneously broke shared-mode startup.** Once the seven-tenant design was in place, launching them in a tight loop caused several tenants to crash during startup with KV-cache allocation errors. The fix was staggered startup so each process could finish memory profiling and reach steady state before the next one began.
+
 ## Results
+
+All seven tenants completed successfully in both configurations. Request success rate was 100% in both modes with no dropped requests and no server crashes during the measured runs.
 
 ### Tenant A p95 latency — shared vs MIG
 
@@ -376,35 +390,49 @@ Outputs:
 
 | Phase | Shared GPU | MIG | Delta |
 |:------|:----------:|:---:|:-----:|
-| Quiet   | ~2,500ms | ~1,300ms | −1,180ms (−48%) |
-| Burst   | ~2,600ms | ~1,300ms | −1,300ms (−50%) |
-| Burst+  | ~2,700ms | ~1,300ms | −1,400ms (−52%) |
-| Variance across phases | +180ms | < 5ms | — |
+| Quiet  | ~2,499ms | ~1,319ms | −1,180ms (−47%) |
+| Burst  | ~2,567ms | ~1,318ms | −1,249ms (−49%) |
+| Burst+ | ~2,571ms | ~1,318ms | −1,253ms (−49%) |
+| Variance across phases | +72ms | <5ms | — |
 
-The ~1,200ms baseline penalty in shared mode is **structural, not burst-triggered**. It exists during the quiet phase — before the noisy tenants have ramped up — because HBM bandwidth is shared across all seven `vLLM` processes from the moment they start serving. When the noisy tenants burst, the penalty grows by a further ~200ms, but the majority of the damage was already done at steady state.
+During the quiet phase, tenant A's p95 latency was about 2,499ms in shared mode and about 1,319ms in MIG mode — a gap of roughly 1,180ms, meaning quiet-phase p95 latency was about 47% lower in MIG mode **before the noisy neighbors even hit their burst phase**.
 
-In MIG mode, tenant A's p95 latency stays flat at ~1,300ms across every phase. The noisy tenants burst to 10–12 RPS with longer outputs and tenant A does not react at all, because its memory path, L2 cache banks, and crossbar ports are hardware-partitioned away from the other six processes.
+This is what makes the result interesting. Shared mode was not acceptable at low load and then degraded once the noisy tenants ramped up. The protected tenant was already paying a large co-location penalty at steady state. The burst phases added only a modest further increase on top of an already elevated baseline in shared mode, while tenant A in MIG mode remained nearly flat across every phase.
+
+The conclusion is not simply that bursts hurt shared mode more. It is that, in this setup, shared GPU co-location imposed a **persistent latency penalty** on the protected tenant, while MIG materially improved isolation by enforcing a harder resource boundary between tenants.
 
 ### Latency timeline across all phases
 
 ![Tenant A p95 timeline](charts/generated/compare/tenant_a_p95_timeline.png)
 
-The timeline shows the two modes diverging from warmup onward. In shared mode the line climbs continuously across phases and never returns to the MIG baseline. The shaded area between the two lines represents the isolation gap — it widens as the noisy tenants ramp up, but its floor was set at startup.
+The timeline shows the two modes diverging from warmup onward. In shared mode the line climbs continuously and never returns to the MIG baseline. The shaded area between the two lines represents the isolation gap — it widens as the noisy tenants ramp up, but its floor was already set at startup.
 
 ### All tenants — quiet-phase p95
 
 ![All tenants quiet phase p95](charts/generated/compare/all_tenants_quiet_p95.png)
 
-The all-tenants chart serves two purposes:
+The all-tenants chart confirms two things:
 
-1. It confirms that the noisy tenants (B–G) were genuinely under load — their shared-mode p95 values are elevated, proving contention was real rather than just high absolute latency from the model.
-2. It shows that MIG flattens the baseline for every tenant, not just the protected one. Each slice gets a predictable allocation regardless of what the others are doing.
+1. The noisy tenants (B–G) were genuinely under load — their shared-mode p95 values are elevated, proving contention was real rather than just high absolute latency from the model.
+2. MIG flattens the baseline for every tenant, not just the protected one. Each slice gets a predictable allocation regardless of what the others are doing.
 
 ### What this means in practice
 
-The experiment is designed to answer one narrow question: does hardware partitioning reduce latency interference? The answer is clearly yes, but two caveats matter:
+In practical terms the result suggests a clear trade-off. If the main goal is tenant isolation, MIG can replace probabilistic sharing with a more predictable hardware boundary. If the main goal is pooled throughput and flexibility, shared mode may still be preferable because idle MIG slices do not automatically help busy neighbors.
 
 - **MIG trades utilization for isolation.** Each `1g.5gb` slice has 1/7th of the GPU's memory bandwidth whether its tenant is busy or idle. Unused capacity in one slice cannot spill over to help a busy neighbor. If your tenants have bursty, uneven traffic, the efficiency cost is real.
-- **The noisy tenants also pay a latency price.** In shared mode their p95 latencies during burst phases reach 10–12 seconds. In MIG mode each noisy tenant is isolated within its own slice, so their burst latencies reflect their own load, not cross-tenant contention. This is not necessarily better — it just means each tenant's performance is self-contained.
+- **The co-location penalty in shared mode is structural, not burst-triggered.** The ~1,180ms gap existed in the quiet phase, before burst traffic became the dominant factor. A burst adds pressure on top of an already degraded baseline — it does not cause the baseline to degrade.
 
-For the full analysis including what failed, root causes, and conclusions, see the [article](https://medium.com/@owumifestus/multi-tenancy-on-nvidia-gpus-benchmarking-latency-isolation-with-mig).
+## Limitations
+
+This benchmark was intentionally narrow. It used one GPU class, one serving stack, one model family, and one workload design. The goal was not to prove a universal law about all shared inference systems. The goal was to test whether MIG materially improved isolation for a protected tenant under a realistic noisy-neighbor setup on a single A100 40GB host. The exact numbers should not be generalized too broadly — different models, runtimes, token lengths, batching strategies, and GPUs may shift the balance.
+
+## Conclusion
+
+On this A100 40GB benchmark, shared GPU co-location imposed a large latency penalty on the protected tenant even before the noisy-neighbor burst became the dominant event. Pinning each tenant to a `1g.5gb` MIG slice materially improved latency isolation.
+
+Tenant A's quiet-phase p95 latency was about 2,499ms in shared mode and about 1,319ms in MIG mode. When the noisy tenants burst, tenant A in MIG mode remained nearly flat. In this benchmark, MIG improved latency isolation by replacing shared contention with more predictable hardware partitions.
+
+If your SLA depends on p95 latency and you need one tenant to remain stable while its neighbors get noisy, that trade-off is worth it. If your workloads are light enough or your GPU is large enough, shared mode may still give better utilization — interference that does not show up under light load is not always absent, sometimes the system simply has too much slack for the signal to become visible.
+
+For the full analysis including root causes and conclusions, see the [article](https://medium.com/@owumifestus/benchmarking-noisy-neighbor-isolation-on-an-a100-shared-vllm-vs-1g-5gb-mig-slices-d45f777d99f0).
