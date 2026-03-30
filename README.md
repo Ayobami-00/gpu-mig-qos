@@ -50,6 +50,216 @@ gpu-mig-qos/
 └── requirements.txt
 ```
 
+## Codebase walkthrough
+
+### `apps/`
+
+This folder holds the actual benchmark harness. The key file is `apps/loadgen/run.py`. It reads a scenario YAML file, builds typed `Tenant` and `Phase` objects from it, fires async HTTP requests at each tenant's endpoint for the duration of each phase, and writes every result row to a CSV. The load shape is data-driven and can be changed independently of the runtime scripts.
+
+The core data model is two small dataclasses:
+
+```python
+@dataclass
+class Phase:
+    name: str
+    duration_s: float
+    rps: float
+    max_tokens: int
+    temperature: float
+
+@dataclass
+class Tenant:
+    name: str
+    endpoint: str
+    model: str
+    prompt: str
+    system_prompt: str
+    concurrency: int
+    timeout_s: float
+    phases: list[Phase]
+```
+
+Each request is issued asynchronously via `httpx`. The rate is enforced with a simple token-bucket-style loop: one task is dispatched per `1/rps` seconds, with a semaphore capping outstanding concurrency.
+
+```python
+async def run_phase(client, api_key, tenant, phase, start_time, rows):
+    semaphore = asyncio.Semaphore(tenant.concurrency)
+    interval = 1.0 / phase.rps
+    end_time = time.perf_counter() + phase.duration_s
+
+    async def worker(scheduled_at):
+        async with semaphore:
+            row = await issue_request(client, api_key, tenant, phase, scheduled_at)
+            rows.append(row)
+
+    next_fire = time.perf_counter()
+    while next_fire < end_time:
+        now = time.perf_counter()
+        if now < next_fire:
+            await asyncio.sleep(next_fire - now)
+        phase_tasks.append(asyncio.create_task(worker(time.perf_counter())))
+        next_fire += interval
+
+    await asyncio.gather(*phase_tasks)
+```
+
+Each row records `tenant`, `phase`, `status_code`, `latency_ms`, `prompt_tokens`, `completion_tokens`, and `error`. All seven tenants run their phases concurrently using `asyncio.gather`, so the load generator drives the full 7-tenant workload from a single process.
+
+Before the timed run starts, the load generator fires one preflight request per unique `(tenant, max_tokens, temperature)` combination to catch misconfigured endpoints before any timing data is collected.
+
+### `configs/`
+
+This folder is where the project becomes declarative. There are two configuration families: `configs/vllm/` and `configs/scenarios/`.
+
+`configs/vllm/` defines how each vLLM server process runs. Here is tenant A's shared-mode config:
+
+```yaml
+host: 0.0.0.0
+port: 8000
+dtype: half
+max-model-len: 2048
+max-num-seqs: 8
+max-num-batched-tokens: 1024
+gpu-memory-utilization: 0.12
+enforce-eager: true
+disable-log-stats: true
+```
+
+The key parameters are `gpu-memory-utilization` (what fraction of GPU memory this process is allowed to claim) and `enforce-eager` (forces PyTorch eager execution rather than CUDA graphs, which is required to keep the comparison honest between modes). Each tenant in each mode has its own file under `configs/vllm/shared/` or `configs/vllm/mig/`.
+
+`configs/scenarios/` defines the benchmark itself. Here is tenant A's entry in `shared.yaml`, showing the 4-phase structure:
+
+```yaml
+tenant_a:
+  endpoint: http://127.0.0.1:8000/v1
+  model: ${MODEL_ID}
+  prompt_path: ../../prompts/tenant_a.txt
+  concurrency: 8
+  phases:
+    - name: warmup
+      duration_s: 20
+      rps: 1.0
+      max_tokens: 64
+      temperature: 0.0
+    - name: quiet
+      duration_s: 60
+      rps: 3.0
+      max_tokens: 64
+      temperature: 0.0
+    - name: burst
+      duration_s: 60
+      rps: 3.0
+      max_tokens: 64
+      temperature: 0.0
+    - name: burst_2
+      duration_s: 60
+      rps: 3.0
+      max_tokens: 64
+      temperature: 0.0
+```
+
+Tenant A's RPS stays flat at 3.0 across all phases. The noisy tenants B through G ramp from 2.0 RPS at `quiet` to 10.0–12.0 RPS at `burst` and `burst_2`, with `max_tokens` jumping from 64 to 144 to generate more decode pressure. The `${MODEL_ID}` placeholder is expanded from the environment at runtime, which keeps the model selection out of the scenario file.
+
+This split between server config and scenario config separates how the server behaves from how the workload behaves. That separation makes it easy to change one without touching the other.
+
+### `scripts/`
+
+This folder is the operational backbone of the project. Each script encodes one step in the experiment lifecycle and can be run independently.
+
+`start_shared_mode.sh` shows the staggered startup pattern that solved the simultaneous memory profiling problem:
+
+```bash
+MODEL_ID="${MODEL_ID:-Qwen/Qwen2.5-1.5B-Instruct}"
+BASE_GPU="${BASE_GPU:-0}"
+
+# Tenant A starts first and gets 45 seconds to stabilize
+CUDA_VISIBLE_DEVICES="${BASE_GPU}" \
+vllm serve "${MODEL_ID}" \
+  --config configs/vllm/shared/tenant-a.yaml \
+  --api-key "${VLLM_API_KEY}" \
+  >"${LOG_DIR}/tenant-a.log" 2>&1 &
+
+sleep 45
+
+# Each subsequent tenant waits 50s so vLLM memory profiling
+# does not race with the next process loading its weights
+CUDA_VISIBLE_DEVICES="${BASE_GPU}" \
+vllm serve "${MODEL_ID}" \
+  --config configs/vllm/shared/tenant-b.yaml \
+  --api-key "${VLLM_API_KEY}" \
+  >"${LOG_DIR}/tenant-b.log" 2>&1 &
+
+sleep 50
+# ... repeated through tenant G
+```
+
+`start_mig_mode.sh` does the same for MIG, but instead of a shared GPU index it resolves each `MIG-<UUID>` from `nvidia-smi -L` and binds each server to its own slice via `CUDA_VISIBLE_DEVICES`. This is the binding that enforces hardware isolation at the OS level.
+
+`run_experiment.sh` ties everything together. It creates the timestamped output directory, calls `capture_state.sh` before and after the run, invokes the load generator, and then calls the charting scripts. A single `./scripts/run_experiment.sh shared` or `./scripts/run_experiment.sh mig` runs the full measurement cycle.
+
+### `prompts/`
+
+This folder is small, but conceptually important. The prompt files define the semantic shape of each tenant's workload, which directly affects how much decode work the model has to do per request.
+
+Tenant A uses a short, tightly scoped prompt designed to produce a predictable, moderate-length response:
+
+```text
+Explain the Rust ownership model in two short paragraphs, then give a
+six-line Rust example involving borrowing, and finish with two brief
+bullet takeaways.
+```
+
+Tenants B through G share a heavier prompt designed to force a longer, more structured response and more tokens generated. This means more HBM reads per request — which is the pressure mechanism:
+
+```text
+You are helping a systems engineer compare GPU partitioning strategies.
+Write a structured answer that explains the trade-offs between shared
+GPUs, hard partitioning, and predictable latency for inference platforms.
+Include a short list of operational risks and a short list of situations
+where hard isolation is worth the cost.
+```
+
+Keeping prompts in files does two things: it makes the workload shape explicit and auditable, and it makes prompt changes show up as diffs in version control rather than buried inside a load-generator argument string.
+
+### `experiments/`
+
+This folder is the evidence archive. Every run produces a timestamped directory:
+
+```text
+experiments/shared/20260329-162848/
+├── scenario.yaml          # exact scenario file used
+├── scenario_resolved.json # scenario after env-var expansion
+├── requests.csv           # one row per HTTP request
+├── summary.csv            # p50/p95/p99/success per tenant per phase
+├── state-before/          # nvidia-smi and MIG inventory pre-run
+├── state-after/           # nvidia-smi and MIG inventory post-run
+└── charts/                # per-run figures
+```
+
+`requests.csv` has one row per request across all tenants and phases, with columns for `tenant`, `phase`, `latency_ms`, `status_code`, `prompt_tokens`, `completion_tokens`, and `error`. `summary.csv` aggregates those into p50, p95, and p99 per `(tenant, phase)` pair — that is the file the charting scripts read.
+
+This structure makes the benchmark auditable. Every claim in the results section has a corresponding artifact on disk.
+
+### `logs/`
+
+The `logs/` folder captures raw stdout/stderr from each vLLM server process, one file per tenant per mode:
+
+```text
+logs/shared/tenant-a.log
+logs/shared/tenant-b.log
+...
+logs/mig/tenant-a.log
+```
+
+This is the first place to look when something fails. During development it was the most useful debugging surface, because it exposed the exact difference between _the GPU ran out of memory during KV cache allocation_ and _the request payload was malformed_. Those two errors look identical from the load generator's perspective — both return a non-200 status — but the server log shows the full stack trace.
+
+### `charts/`
+
+This folder turns the raw CSVs into figures. There are two scripts:
+
+- **`plot_results.py`** — generates per-run charts for a single `summary.csv`. Called automatically by `run_experiment.sh` at the end of every run.
+- **`compare_modes.py`** — loads both the shared and MIG summary CSVs and generates the side-by-side comparison figures. It takes explicit `--shared-summary` and `--mig-summary` arguments so the comparison is always between two specific identified runs rather than implicitly using whatever files happen to be in `latest/`. The three output figures — the hero bar chart, the all-tenants quiet-phase chart, and the tenant A timeline — are the ones used in the results section.
+
 ## Experiment design
 
 Seven tenants run concurrently in each mode:
