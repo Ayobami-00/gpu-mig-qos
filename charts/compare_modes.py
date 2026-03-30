@@ -85,7 +85,7 @@ def plot_tenant_a_hero(df: pd.DataFrame, output_path: Path) -> None:
             s_val = shared_rows.loc[p, "p95_latency_ms"]
             m_val = mig_rows.loc[p, "p95_latency_ms"]
             delta = s_val - m_val
-            pct = delta / m_val * 100
+            pct = delta / s_val * 100
             ax.annotate(
                 f"−{delta:.0f}ms\n(−{pct:.0f}%)",
                 xy=(j, (s_val + m_val) / 2),
